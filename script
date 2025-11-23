@@ -37,13 +37,15 @@ log "Starting rclone sync via Docker (sequential transfers)..."
 # Build rclone args
 RARGS=(sync
    --config="$RCLONE_CONFIG_PATH"
-  "$RCLONE_REMOTE"
-  "$RCLONE_DEST_PATH"
-  --create-empty-src-dirs
-  --transfers="$RCLONE_TRANSFERS"
-  --checkers="$RCLONE_CHECKERS"
-  --progress
-  --stats=30s
+   "$RCLONE_REMOTE"
+   "$RCLONE_DEST_PATH"
+   --create-empty-src-dirs
+   --transfers="$RCLONE_TRANSFERS"
+   --checkers="$RCLONE_CHECKERS"
+   --ignore-existing
+   --size-only
+   --progress
+   --stats=30s
 )
 
 # Optional bandwidth limit
