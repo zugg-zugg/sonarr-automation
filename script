@@ -16,25 +16,22 @@ RCLONE_DEST_PATH="/data/incoming"
 
 # Name of your rclone Docker container (e.g., binhex-rclone)
 RCLONE_CONTAINER="binhex-rclone"
-RCLONE_CONFIG_PATH="/config/rclone/config/rclone.conf"   # Inside the rclone container
+RCLONE_CONFIG_PATH="/config/rclone/config/rclone.conf"
 
-# Remote + path - This is tied to your RClone config that needs to be configured prior.
+# Remote path
 RCLONE_REMOTE="sample:/home/path/"
 
-# Throttling/Staggering controls:
-RCLONE_TRANSFERS=1          # 1 = sequential transfers (staggered)
-RCLONE_CHECKERS=2           # keep metadata checks light
-RCLONE_BWLIMIT=""           # e.g., "8M" to cap to ~8 MiB/s; leave empty for no cap
+RCLONE_TRANSFERS=2
+RCLONE_CHECKERS=2
+RCLONE_BWLIMIT=""
 # ============================
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE" ; }
 
-# Ensure log dir + import dir exist
 mkdir -p "$(dirname "$LOG_FILE")" "$SONARR_IMPORT_PATH"
 
-log "Starting rclone sync via Docker (sequential transfers)..."
+log "Starting rclone sync via Docker…"
 
-# Build rclone args
 RARGS=(sync
    --config="$RCLONE_CONFIG_PATH"
    "$RCLONE_REMOTE"
@@ -48,15 +45,8 @@ RARGS=(sync
    --stats=30s
 )
 
-# Optional bandwidth limit
 if [[ -n "$RCLONE_BWLIMIT" ]]; then
   RARGS+=(--bwlimit "$RCLONE_BWLIMIT")
-fi
-
-# Run rclone inside the container
-if [[ -z "$RCLONE_CONTAINER" ]]; then
-  log "❌ ERROR: RCLONE_CONTAINER is empty. Set the container name running rclone (e.g., binhex-rclone)."
-  exit 1
 fi
 
 docker exec "$RCLONE_CONTAINER" rclone "${RARGS[@]}" >> "$LOG_FILE" 2>&1
@@ -69,38 +59,75 @@ fi
 
 log "✅ rclone sync completed."
 
-# ====== Extract any .rar archives ======
+# =====================================================================
+#        EXTRACTION + MEDIA DETECTION + SAMPLE REMOVAL UPGRADE
+# =====================================================================
+
 log "Scanning for .rar files to extract..."
 
-# Use unrar if available; fall back to 7z if needed
+# Choose extraction tool
 EXTRACTOR=""
 if command -v unrar >/dev/null 2>&1; then
-  EXTRACTOR="unrar x -o+"
+  EXTRACTOR="unrar x -o+ -y"
 elif command -v 7z >/dev/null 2>&1; then
   EXTRACTOR="7z x -y"
 else
-  log "❌ No extractor found (need 'unrar' or '7z'). Skipping extraction."
+  log "❌ ERROR: No extractor available (unrar/7z missing)"
 fi
 
 if [[ -n "$EXTRACTOR" ]]; then
-  # Find only the *first* part archives to avoid double-extract
-  # Match .rar and .part1.rar (common patterns)
-  while IFS= read -r rarfile; do
+  find "$SONARR_IMPORT_PATH" -type f \( -iname '*.part1.rar' -o -iname '*.rar' \) | while read -r rarfile; do
     extract_dir="$(dirname "$rarfile")"
-    log "Extracting: $rarfile into $extract_dir"
+    log "📦 Extracting: $rarfile → $extract_dir"
+
     $EXTRACTOR "$rarfile" -o"$extract_dir" >> "$LOG_FILE" 2>&1
 
-    # Cleanup archive parts in that directory after successful extract
-    log "Cleaning up archive parts in $extract_dir"
+    # ====== Remove samples ======
+    log "🔍 Removing sample files in $extract_dir..."
+    find "$extract_dir" -maxdepth 1 -type f -iname "sample.*" -print -delete >> "$LOG_FILE" 2>&1
+
+    # ====== Detect media files ======
+    log "🔍 Detecting media files in $extract_dir..."
+
+    mapfile -t media_files < <(
+      find "$extract_dir" -maxdepth 1 -type f \( \
+         -iname '*.mkv' -o -iname '*.mp4' -o -iname '*.avi' -o -iname '*.mov' \
+      \)
+    )
+
+    if [[ ${#media_files[@]} -eq 0 ]]; then
+      log "❌ No media files found after extraction! Skipping cleanup to avoid data loss."
+      continue
+    fi
+
+    # ====== Find largest media file ======
+    largest_media=$(ls -S "${media_files[@]}" 2>/dev/null | head -n 1)
+
+    log "🎥 Largest extracted media file: $(basename "$largest_media")"
+
+    # ====== Cleanup archive files ONLY AFTER confirming the media exists ======
+    log "🧼 Cleaning up archive parts in $extract_dir…"
+
     find "$extract_dir" -maxdepth 1 -type f \
-      \( -iname '*.rar' -o -iname '*.r[0-9][0-9]' -o -iname '*.rev' -o -iname '*.part[0-9]*.rar' \) \
-      -delete 2>>"$LOG_FILE"
-  done < <(find "$SONARR_IMPORT_PATH" -type f \( -iname '*.part1.rar' -o -iname '*.rar' \))
+      \( \
+        -iname '*.rar' \
+        -o -regex '.*\.part[0-9]+\.rar$' \
+        -o -regex '.*\.r[0-9][0-9]$' \
+        -o -iname '*.rev' \
+      \) -print -delete >> "$LOG_FILE" 2>&1
+
+    log "✅ Cleanup completed for: $extract_dir"
+
+  done
+else
+  log "⚠️ Extraction skipped — no extractor available."
 fi
 
-log "✅ Extraction complete."
+log "✅ Extraction phase complete."
 
-# ====== Trigger SONARR import ======
+# =====================================================================
+#                 SONARR IMPORT TRIGGER
+# =====================================================================
 log "Starting SONARR import for: $SONARR_IMPORT_PATH"
 
 RESPONSE=$(curl -s -w "\nHTTP_STATUS_CODE:%{http_code}" -X POST "${SONARR_URL}/api/v3/command" \
@@ -114,19 +141,20 @@ BODY=$(echo "$RESPONSE" | sed '/HTTP_STATUS_CODE/d')
 if [[ "$HTTP_CODE" == "201" || "$HTTP_CODE" == "200" ]]; then
   log "✅ SONARR import successful."
 else
-  log "❌ ERROR - SONARR returned HTTP $HTTP_CODE"
+  log "❌ ERROR: SONARR returned HTTP $HTTP_CODE"
   log "Response body: $BODY"
 fi
 
-# ====== Fix permissions (in case rclone writes as root) ======
+# =====================================================================
+#               PERMISSION FIX
+# =====================================================================
 if chown -R nobody:users "$SONARR_IMPORT_PATH" 2>>"$LOG_FILE"; then
-  log "✅ Permissions fixed on $SONARR_IMPORT_PATH"
+  log "✅ Permissions fixed for $SONARR_IMPORT_PATH"
 else
-  log "⚠️  Could not chown $SONARR_IMPORT_PATH (check permissions)."
+  log "⚠️ Permission fix failed — manual check recommended."
 fi
 
-# ====== Optional: Clean old logs (rotate by age) ======
-# Keeps only logs older than 30 days removed (file name match safeguard)
+# Cleanup old logs
 find "$(dirname "$LOG_FILE")" -type f -name "$(basename "$LOG_FILE")" -mtime +30 -delete 2>>"$LOG_FILE"
 
 log "🏁 Script completed."
