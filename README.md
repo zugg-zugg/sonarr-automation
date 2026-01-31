@@ -15,6 +15,12 @@ This Script interlaces Sonarr's requests and automation to download, extract and
 - RCLONE_CHECKERS=2 - Controls the metadata checks - Two seems to be a decent starting point.
 - RCLONE_BWLIMIT="" - Allows you to place a cap on the bandwidth the downloads can consume. For example "24M" would cap the bandwidth to 24 MiB/s. You can leave this empty for no cap.
 
+New in V4 - Jan 30th 2026
+- MIN_FILE_AGE_SECONDS=300 — Wait 5 min after last modification before extracting (prevents extracting mid-download)
+- SKIP_INCOMPLETE=true — If parts are missing, skip and retry next run (vs. quarantine immediately)
+- MAX_EXTRACT_RETRIES=2 — Number of extraction attempts before quarantining
+- QUARANTINE_DIR — Where failed archives go for manual inspection
+
 # Process
 - Leveraging a proxy that interacts with trackers (Jackett or Prowlerr) Sonarr can monitor movies or tv series ((Sonarr).
 - When Sonarr determines a requested media such as a movie or tv episode is missing it initates a tracker query and begins the download to a preconfigured source. (Ex. Qbittorent on a Seedbox)
