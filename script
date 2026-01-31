@@ -3,158 +3,441 @@ set -o pipefail
 
 # ====== Configuration ======
 TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
-LOG_FILE="/mnt/user/logs/SONARR_import.log"
+LOG_FILE="/mnt/user/logs/RADARR_import.log"
+STATE_DIR="/mnt/user/logs/extract_state"      # Track what's been extracted
+QUARANTINE_DIR="/mnt/user/media/quarantine"   # Failed/corrupt archives go here
 
-SONARR_API_KEY="API-KEY"
-SONARR_URL="http://localhost:8989"
+RADARR_API_KEY="API-KEY-HERE"
+RADARR_URL="http://localhost:7878" # Default Path and Port for a Radarr container - Adjust as needed. 
 
 # Local path where files land (mounted into your rclone container as /data)
-SONARR_IMPORT_PATH="/mnt/user/media/incoming"
+RADARR_IMPORT_PATH="/mnt/user/media/incoming"
 
-# Path *inside* the rclone container that maps to SONARR_IMPORT_PATH
+# Path *inside* the rclone container that maps to RADARR_IMPORT_PATH
 RCLONE_DEST_PATH="/data/incoming"
 
 # Name of your rclone Docker container (e.g., binhex-rclone)
 RCLONE_CONTAINER="binhex-rclone"
 RCLONE_CONFIG_PATH="/config/rclone/config/rclone.conf"
 
-# Remote path
-RCLONE_REMOTE="sample:/home/path/"
+# Remote + path
+RCLONE_REMOTE="remotepatch:/home/location/files"
 
-RCLONE_TRANSFERS=2
+# Throttling/Staggering controls
+RCLONE_TRANSFERS=2 
 RCLONE_CHECKERS=2
 RCLONE_BWLIMIT=""
+
+# Extraction settings
+MAX_EXTRACT_RETRIES=2         # How many times to retry a failed extraction
+SKIP_INCOMPLETE=true          # Skip archives missing parts (vs quarantine)
+MIN_FILE_AGE_SECONDS=300      # Don't extract files modified in last 5 min (still downloading)
 # ============================
 
-log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE" ; }
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"; }
 
-mkdir -p "$(dirname "$LOG_FILE")" "$SONARR_IMPORT_PATH"
+# Ensure directories exist
+mkdir -p "$(dirname "$LOG_FILE")" "$RADARR_IMPORT_PATH" "$STATE_DIR" "$QUARANTINE_DIR"
 
-log "Starting rclone sync via Docker…"
+# ====== Helper Functions ======
+
+# Get a hash of the archive path for state tracking
+get_state_file() {
+    local archive="$1"
+    echo "$STATE_DIR/$(echo "$archive" | md5sum | cut -d' ' -f1)"
+}
+
+# Check if archive was already successfully extracted
+is_already_extracted() {
+    local archive="$1"
+    local state_file
+    state_file=$(get_state_file "$archive")
+    [[ -f "$state_file" ]]
+}
+
+# Mark archive as successfully extracted
+mark_extracted() {
+    local archive="$1"
+    local state_file
+    state_file=$(get_state_file "$archive")
+    echo "$archive" > "$state_file"
+}
+
+# Check if file is still being written (recently modified)
+is_file_still_downloading() {
+    local file="$1"
+    local mtime now age
+    mtime=$(stat -c %Y "$file" 2>/dev/null) || return 1
+    now=$(date +%s)
+    age=$((now - mtime))
+    [[ $age -lt $MIN_FILE_AGE_SECONDS ]]
+}
+
+# Find the "main" rar file for a set (handles .part1.rar and plain .rar)
+find_main_rar() {
+    local dir="$1"
+    local basename="$2"
+    
+    # Check for .part1.rar first (newer multi-part format)
+    local part1="${dir}/${basename}.part1.rar"
+    [[ -f "$part1" ]] && echo "$part1" && return 0
+    
+    # Check for plain .rar (older format where .r00, .r01 are the parts)
+    local plain="${dir}/${basename}.rar"
+    [[ -f "$plain" ]] && echo "$plain" && return 0
+    
+    return 1
+}
+
+# Count expected parts for a multi-part archive
+# Returns: "complete" if all parts found, "incomplete:missing_list" otherwise
+check_archive_parts() {
+    local main_rar="$1"
+    local dir basename
+    dir=$(dirname "$main_rar")
+    basename=$(basename "$main_rar")
+    
+    # Handle .part1.rar format (part1, part2, part3...)
+    if [[ "$basename" =~ \.part([0-9]+)\.rar$ ]]; then
+        local name_prefix="${basename%.part*.rar}"
+        local parts=()
+        local missing=()
+        
+        # Find highest part number
+        local highest=0
+        for f in "$dir"/"$name_prefix".part*.rar; do
+            [[ -f "$f" ]] || continue
+            if [[ "$(basename "$f")" =~ \.part([0-9]+)\.rar$ ]]; then
+                local num="${BASH_REMATCH[1]}"
+                ((num > highest)) && highest=$num
+            fi
+        done
+        
+        # Check all parts exist
+        for ((i=1; i<=highest; i++)); do
+            local partfile="$dir/${name_prefix}.part${i}.rar"
+            if [[ ! -f "$partfile" ]]; then
+                missing+=("part${i}.rar")
+            fi
+        done
+        
+        if [[ ${#missing[@]} -eq 0 ]]; then
+            echo "complete"
+        else
+            echo "incomplete:${missing[*]}"
+        fi
+        return 0
+    fi
+    
+    # Handle old .rar + .r00, .r01... format
+    if [[ "$basename" =~ \.rar$ ]]; then
+        local name_prefix="${basename%.rar}"
+        local missing=()
+        
+        # Find highest .rXX number
+        local highest=-1
+        for f in "$dir"/"$name_prefix".r[0-9][0-9]; do
+            [[ -f "$f" ]] || continue
+            if [[ "$(basename "$f")" =~ \.r([0-9][0-9])$ ]]; then
+                local num=$((10#${BASH_REMATCH[1]}))  # Force base-10
+                ((num > highest)) && highest=$num
+            fi
+        done
+        
+        # If no .rXX files, it's a single-file archive
+        if [[ $highest -lt 0 ]]; then
+            echo "complete"
+            return 0
+        fi
+        
+        # Check all parts exist (.r00 through .rXX)
+        for ((i=0; i<=highest; i++)); do
+            local partfile
+            printf -v partfile "%s/%s.r%02d" "$dir" "$name_prefix" "$i"
+            if [[ ! -f "$partfile" ]]; then
+                printf -v missing_name ".r%02d" "$i"
+                missing+=("$missing_name")
+            fi
+        done
+        
+        if [[ ${#missing[@]} -eq 0 ]]; then
+            echo "complete"
+        else
+            echo "incomplete:${missing[*]}"
+        fi
+        return 0
+    fi
+    
+    # Unknown format, assume complete
+    echo "complete"
+}
+
+# Test archive integrity using unrar or 7z
+test_archive_integrity() {
+    local archive="$1"
+    local result
+    
+    if command -v unrar >/dev/null 2>&1; then
+        unrar t -idq "$archive" >/dev/null 2>&1
+        return $?
+    elif command -v 7z >/dev/null 2>&1; then
+        7z t "$archive" >/dev/null 2>&1
+        return $?
+    else
+        # No tool available, assume OK
+        return 0
+    fi
+}
+
+# Extract archive with proper error handling
+extract_archive() {
+    local archive="$1"
+    local dest_dir="$2"
+    local rc
+    
+    if command -v unrar >/dev/null 2>&1; then
+        unrar x -o+ -idq "$archive" "$dest_dir/" >> "$LOG_FILE" 2>&1
+        rc=$?
+    elif command -v 7z >/dev/null 2>&1; then
+        7z x -y -o"$dest_dir" "$archive" >> "$LOG_FILE" 2>&1
+        rc=$?
+    else
+        log "  ❌ No extractor available (need 'unrar' or '7z')"
+        return 1
+    fi
+    
+    return $rc
+}
+
+# Move archive and all its parts to quarantine
+quarantine_archive() {
+    local archive="$1"
+    local reason="$2"
+    local dir basename name_prefix
+    dir=$(dirname "$archive")
+    basename=$(basename "$archive")
+    
+    # Determine the base name for finding related parts
+    if [[ "$basename" =~ \.part[0-9]+\.rar$ ]]; then
+        name_prefix="${basename%.part*.rar}"
+    else
+        name_prefix="${basename%.rar}"
+    fi
+    
+    local quarantine_subdir="$QUARANTINE_DIR/$(date +%Y%m%d)_${name_prefix}"
+    mkdir -p "$quarantine_subdir"
+    
+    # Move all related archive files
+    find "$dir" -maxdepth 1 -type f \( \
+        -name "${name_prefix}.rar" \
+        -o -name "${name_prefix}.r[0-9][0-9]" \
+        -o -name "${name_prefix}.part*.rar" \
+        -o -name "${name_prefix}.rev" \
+    \) -exec mv {} "$quarantine_subdir/" \; 2>>"$LOG_FILE"
+    
+    # Write reason file
+    echo "Quarantined: $(date)" > "$quarantine_subdir/REASON.txt"
+    echo "Original location: $dir" >> "$quarantine_subdir/REASON.txt"
+    echo "Reason: $reason" >> "$quarantine_subdir/REASON.txt"
+    
+    log "  📦 Quarantined to: $quarantine_subdir"
+}
+
+# Clean up archive parts after successful extraction
+cleanup_archive_parts() {
+    local archive="$1"
+    local dir basename name_prefix
+    dir=$(dirname "$archive")
+    basename=$(basename "$archive")
+    
+    if [[ "$basename" =~ \.part[0-9]+\.rar$ ]]; then
+        name_prefix="${basename%.part*.rar}"
+    else
+        name_prefix="${basename%.rar}"
+    fi
+    
+    find "$dir" -maxdepth 1 -type f \( \
+        -name "${name_prefix}.rar" \
+        -o -name "${name_prefix}.r[0-9][0-9]" \
+        -o -name "${name_prefix}.part*.rar" \
+        -o -name "${name_prefix}.rev" \
+    \) -delete 2>>"$LOG_FILE"
+}
+
+# ====== Main Script ======
+
+log "========================================"
+log "Starting import script"
+log "========================================"
+
+# ====== RCLONE SYNC ======
+log "Starting rclone sync via Docker..."
 
 RARGS=(sync
-   --config="$RCLONE_CONFIG_PATH"
-   "$RCLONE_REMOTE"
-   "$RCLONE_DEST_PATH"
-   --create-empty-src-dirs
-   --transfers="$RCLONE_TRANSFERS"
-   --checkers="$RCLONE_CHECKERS"
-   --ignore-existing
-   --size-only
-   --progress
-   --stats=30s
+    --config="$RCLONE_CONFIG_PATH"
+    "$RCLONE_REMOTE"
+    "$RCLONE_DEST_PATH"
+    --create-empty-src-dirs
+    --transfers="$RCLONE_TRANSFERS"
+    --checkers="$RCLONE_CHECKERS"
+    --progress
+    --stats=30s
 )
 
-if [[ -n "$RCLONE_BWLIMIT" ]]; then
-  RARGS+=(--bwlimit "$RCLONE_BWLIMIT")
+[[ -n "$RCLONE_BWLIMIT" ]] && RARGS+=(--bwlimit "$RCLONE_BWLIMIT")
+
+if [[ -z "$RCLONE_CONTAINER" ]]; then
+    log "❌ ERROR: RCLONE_CONTAINER is empty."
+    exit 1
 fi
 
 docker exec "$RCLONE_CONTAINER" rclone "${RARGS[@]}" >> "$LOG_FILE" 2>&1
 RC=$?
 
 if [[ $RC -ne 0 ]]; then
-  log "❌ rclone sync failed with exit code $RC"
-  exit $RC
+    log "❌ rclone sync failed with exit code $RC"
+    exit $RC
 fi
 
 log "✅ rclone sync completed."
 
-# =====================================================================
-#        EXTRACTION + MEDIA DETECTION + SAMPLE REMOVAL UPGRADE
-# =====================================================================
+# ====== ARCHIVE EXTRACTION ======
+log "Scanning for archives to extract..."
 
-log "Scanning for .rar files to extract..."
+# Build list of unique archive sets (avoid processing .part2, .part3, etc.)
+declare -A ARCHIVE_SETS
 
-# Choose extraction tool
-EXTRACTOR=""
-if command -v unrar >/dev/null 2>&1; then
-  EXTRACTOR="unrar x -o+ -y"
-elif command -v 7z >/dev/null 2>&1; then
-  EXTRACTOR="7z x -y"
-else
-  log "❌ ERROR: No extractor available (unrar/7z missing)"
-fi
-
-if [[ -n "$EXTRACTOR" ]]; then
-  find "$SONARR_IMPORT_PATH" -type f \( -iname '*.part1.rar' -o -iname '*.rar' \) | while read -r rarfile; do
-    extract_dir="$(dirname "$rarfile")"
-    log "📦 Extracting: $rarfile → $extract_dir"
-
-    $EXTRACTOR "$rarfile" -o"$extract_dir" >> "$LOG_FILE" 2>&1
-
-    # ====== Remove samples ======
-    log "🔍 Removing sample files in $extract_dir..."
-    find "$extract_dir" -maxdepth 1 -type f -iname "sample.*" -print -delete >> "$LOG_FILE" 2>&1
-
-    # ====== Detect media files ======
-    log "🔍 Detecting media files in $extract_dir..."
-
-    mapfile -t media_files < <(
-      find "$extract_dir" -maxdepth 1 -type f \( \
-         -iname '*.mkv' -o -iname '*.mp4' -o -iname '*.avi' -o -iname '*.mov' \
-      \)
-    )
-
-    if [[ ${#media_files[@]} -eq 0 ]]; then
-      log "❌ No media files found after extraction! Skipping cleanup to avoid data loss."
-      continue
+while IFS= read -r -d '' rarfile; do
+    dir=$(dirname "$rarfile")
+    basename=$(basename "$rarfile")
+    
+    # Determine the archive set identifier
+    if [[ "$basename" =~ ^(.+)\.part[0-9]+\.rar$ ]]; then
+        set_id="${dir}/${BASH_REMATCH[1]}"
+        main_file="${dir}/${BASH_REMATCH[1]}.part1.rar"
+    elif [[ "$basename" =~ ^(.+)\.rar$ ]]; then
+        set_id="${dir}/${BASH_REMATCH[1]}"
+        main_file="$rarfile"
+    else
+        continue
     fi
+    
+    # Only track if we haven't seen this set and main file exists
+    if [[ -z "${ARCHIVE_SETS[$set_id]}" ]] && [[ -f "$main_file" ]]; then
+        ARCHIVE_SETS["$set_id"]="$main_file"
+    fi
+done < <(find "$RADARR_IMPORT_PATH" -type f -iname '*.rar' -print0 2>/dev/null)
 
-    # ====== Find largest media file ======
-    largest_media=$(ls -S "${media_files[@]}" 2>/dev/null | head -n 1)
+TOTAL_ARCHIVES=${#ARCHIVE_SETS[@]}
+log "Found $TOTAL_ARCHIVES archive set(s) to process."
 
-    log "🎥 Largest extracted media file: $(basename "$largest_media")"
+EXTRACTED=0
+SKIPPED=0
+FAILED=0
 
-    # ====== Cleanup archive files ONLY AFTER confirming the media exists ======
-    log "🧼 Cleaning up archive parts in $extract_dir…"
+for set_id in "${!ARCHIVE_SETS[@]}"; do
+    main_rar="${ARCHIVE_SETS[$set_id]}"
+    extract_dir=$(dirname "$main_rar")
+    
+    log "Processing: $main_rar"
+    
+    # Skip if already extracted
+    if is_already_extracted "$main_rar"; then
+        log "  ⏭️  Already extracted, skipping."
+        ((SKIPPED++))
+        continue
+    fi
+    
+    # Skip if still downloading
+    if is_file_still_downloading "$main_rar"; then
+        log "  ⏳ File recently modified, likely still downloading. Skipping."
+        ((SKIPPED++))
+        continue
+    fi
+    
+    # Check if all parts are present
+    parts_status=$(check_archive_parts "$main_rar")
+    if [[ "$parts_status" != "complete" ]]; then
+        missing="${parts_status#incomplete:}"
+        log "  ⚠️  Missing archive parts: $missing"
+        if [[ "$SKIP_INCOMPLETE" == "true" ]]; then
+            log "  ⏭️  Skipping incomplete archive (will retry next run)."
+            ((SKIPPED++))
+        else
+            quarantine_archive "$main_rar" "Missing parts: $missing"
+            ((FAILED++))
+        fi
+        continue
+    fi
+    
+    # Test archive integrity
+    log "  🔍 Testing archive integrity..."
+    if ! test_archive_integrity "$main_rar"; then
+        log "  ❌ Archive failed integrity check!"
+        quarantine_archive "$main_rar" "Failed integrity check (corrupt or incomplete)"
+        ((FAILED++))
+        continue
+    fi
+    log "  ✅ Integrity check passed."
+    
+    # Attempt extraction with retries
+    attempt=1
+    success=false
+    while [[ $attempt -le $MAX_EXTRACT_RETRIES ]]; do
+        log "  📦 Extracting (attempt $attempt/$MAX_EXTRACT_RETRIES)..."
+        if extract_archive "$main_rar" "$extract_dir"; then
+            success=true
+            break
+        fi
+        log "  ⚠️  Extraction attempt $attempt failed."
+        ((attempt++))
+        sleep 2
+    done
+    
+    if [[ "$success" == "true" ]]; then
+        log "  ✅ Extraction successful."
+        mark_extracted "$main_rar"
+        cleanup_archive_parts "$main_rar"
+        ((EXTRACTED++))
+    else
+        log "  ❌ Extraction failed after $MAX_EXTRACT_RETRIES attempts."
+        quarantine_archive "$main_rar" "Extraction failed after $MAX_EXTRACT_RETRIES attempts"
+        ((FAILED++))
+    fi
+done
 
-    find "$extract_dir" -maxdepth 1 -type f \
-      \( \
-        -iname '*.rar' \
-        -o -regex '.*\.part[0-9]+\.rar$' \
-        -o -regex '.*\.r[0-9][0-9]$' \
-        -o -iname '*.rev' \
-      \) -print -delete >> "$LOG_FILE" 2>&1
+log "Extraction summary: $EXTRACTED extracted, $SKIPPED skipped, $FAILED failed/quarantined"
 
-    log "✅ Cleanup completed for: $extract_dir"
+# ====== TRIGGER RADARR IMPORT ======
+log "Starting RADARR import for: $RADARR_IMPORT_PATH"
 
-  done
-else
-  log "⚠️ Extraction skipped — no extractor available."
-fi
-
-log "✅ Extraction phase complete."
-
-# =====================================================================
-#                 SONARR IMPORT TRIGGER
-# =====================================================================
-log "Starting SONARR import for: $SONARR_IMPORT_PATH"
-
-RESPONSE=$(curl -s -w "\nHTTP_STATUS_CODE:%{http_code}" -X POST "${SONARR_URL}/api/v3/command" \
-     -H "X-Api-Key: ${SONARR_API_KEY}" \
+RESPONSE=$(curl -s -w "\nHTTP_STATUS_CODE:%{http_code}" -X POST "${RADARR_URL}/api/v3/command" \
+     -H "X-Api-Key: ${RADARR_API_KEY}" \
      -H "Content-Type: application/json" \
-     -d "{\"name\": \"manualImport\", \"path\": \"${SONARR_IMPORT_PATH}\", \"importMode\": \"move\"}")
+     -d "{\"name\": \"DownloadedMoviesScan\", \"path\": \"${RADARR_IMPORT_PATH}\"}")
 
 HTTP_CODE=$(echo "$RESPONSE" | awk -F: '/HTTP_STATUS_CODE/ {print $2}')
 BODY=$(echo "$RESPONSE" | sed '/HTTP_STATUS_CODE/d')
 
 if [[ "$HTTP_CODE" == "201" || "$HTTP_CODE" == "200" ]]; then
-  log "✅ SONARR import successful."
+    log "✅ RADARR scan triggered successfully."
 else
-  log "❌ ERROR: SONARR returned HTTP $HTTP_CODE"
-  log "Response body: $BODY"
+    log "❌ ERROR - RADARR returned HTTP $HTTP_CODE"
+    log "Response body: $BODY"
 fi
 
-# =====================================================================
-#               PERMISSION FIX
-# =====================================================================
-if chown -R nobody:users "$SONARR_IMPORT_PATH" 2>>"$LOG_FILE"; then
-  log "✅ Permissions fixed for $SONARR_IMPORT_PATH"
+# ====== FIX PERMISSIONS ======
+if chown -R nobody:users "$RADARR_IMPORT_PATH" 2>>"$LOG_FILE"; then
+    log "✅ Permissions fixed on $RADARR_IMPORT_PATH"
 else
-  log "⚠️ Permission fix failed — manual check recommended."
+    log "⚠️  Could not chown $RADARR_IMPORT_PATH"
 fi
 
-# Cleanup old logs
-find "$(dirname "$LOG_FILE")" -type f -name "$(basename "$LOG_FILE")" -mtime +30 -delete 2>>"$LOG_FILE"
+# ====== CLEANUP OLD STATE FILES (older than 30 days) ======
+find "$STATE_DIR" -type f -mtime +30 -delete 2>/dev/null
+
+# ====== CLEANUP OLD LOGS ======
+find "$(dirname "$LOG_FILE")" -type f -name "*.log" -mtime +30 -delete 2>/dev/null
 
 log "🏁 Script completed."
+log "========================================"
